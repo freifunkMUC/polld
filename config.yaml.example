@@ -1,0 +1,28 @@
+# Example configuration file for polld
+# Copy this file to /etc/polld.yaml and adjust the values for your environment.
+
+# Address and port of YANIC (as a list: [IPv6, Port])
+yanic:
+  host: '2001:bf7:381::3:1'
+  port: 11001
+
+# List of respondd topics to query
+respondd_topics:
+  - nodeinfo
+  - statistics
+  - neighbours
+  - wireguard
+
+# Prefix for etcd configuration entries
+etcd:
+  # Connection config for the etcd client is done in /etc/etcd-client.json, see etcd.py
+  prefix: '/config/'
+
+# InfluxDB configuration
+influx:
+  enabled: false # true to enable InfluxDB
+  connection_type: 'socket' # "socket" or "http"
+  endpoint: '/run/influxdb/influxdb.sock' # For "http" e.g. "http://localhost:8086"
+  database: 'ffbs' # Name of the database
+  username: '' # Optional, only for http
+  password: '' # Optional, only for http

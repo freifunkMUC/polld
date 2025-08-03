@@ -5,9 +5,11 @@ import os
 import random
 import time
 import traceback
-import zlib
 import yaml
+import zlib
 from copy import deepcopy
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import aiohttp
 from aioetcd3.help import range_prefix
@@ -17,15 +19,18 @@ from aioinflux import InfluxDBClient
 
 from ffbstools.etcd import etcd_client
 
+CONFIG_FILE = "/etc/polld.yaml"
+
 POLL_INTERVAL = 60
 PRUNE_INTERVAL = 5 * POLL_INTERVAL
-CONFIG_PREFIX = "/config/"
-# YANIC_ADDR = ('::1', 11001)
-YANIC_ADDR = ("2001:bf7:381::3:1", 11001)
-REQUEST = "GET nodeinfo statistics neighbours wireguard".encode("ascii")
+ETCD_PREFIX: str
+YANIC_ADDR: Tuple[str, int]
+RESPONDD_TOPICS: List[str] = ["nodeinfo", "statistics", "neighbours", "wireguard"]
+REQUEST: bytes
+
 
 # dict of mesh mac addresses of indirect nodes, with {ip: insertion time} as value
-meshed_mac_ips = dict()
+meshed_mac_ips: Dict[str, Dict[str, int]] = dict()
 # map of last request timestamps
 pings = dict()
 
@@ -202,10 +207,11 @@ class ResponddProtocol:
         if trace:
             trace.write(json.dumps(info, indent=4) + "\n")
 
-        influxdb_wireguard(address, info)
+        if influx is not None:
+            influxdb_wireguard(address, info)
 
-        if delay is not None:
-            influxdb_delay(address, info, delay)
+            if delay is not None:
+                influxdb_delay(address, info, delay)
 
         print("received", address[0])
         # if address[0].endswith('::1'):
@@ -267,9 +273,10 @@ class EtcdNodes:
 
 
 async def get_direct_ips():
+    """Fetches IP addresses of ndoes with VPN uplink from etcd."""
     direct_ips = set()
     start = time.monotonic()
-    raw = await etcd_client.range(key_range=range_prefix(CONFIG_PREFIX))
+    raw = await etcd_client.range(key_range=range_prefix(ETCD_PREFIX))
     print("etcd_client.range took {}".format(time.monotonic() - start))
     for k, v, meta in raw:
         if k.decode("ascii").endswith("/address6"):
@@ -451,8 +458,7 @@ def mac_to_ipv6(mac, prefix):
 
 trace = None
 # trace = open('/tmp/polld-trace', 'w')
-# influx = InfluxDBClient(database='ffbs')
-influx = InfluxDBClient(unix_socket="/run/influxdb/influxdb.sock", db="ffbs")
+influx: Optional[InfluxDBClient] = None
 etcd_nodes = EtcdNodes()
 
 try:
@@ -466,7 +472,86 @@ if not meshed_mac_ips:
     meshed_mac_ips = dict()
 
 
+def load_config():
+    """Load configuration from /etc/polld.yaml and set global variables"""
+
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            config = yaml.safe_load(f)
+            if not config:
+                config = {}
+
+            if "yanic" in config:
+                yanic_config = config["yanic"]
+                yanic_host = yanic_config.get("host")
+                yanic_port = yanic_config.get("port")
+                if yanic_host is None or yanic_port is None:
+                    print("ERROR: yanic_addr must have host and port")
+                    exit(1)
+
+                global YANIC_ADDR
+                YANIC_ADDR = (yanic_host, yanic_port)
+            else:
+                print("ERROR: Missing yanic in config")
+                exit(1)
+
+            if "respondd_topics" in config:
+                global RESPONDD_TOPICS, REQUEST
+                RESPONDD_TOPICS = config["respondd_topics"]
+                if not isinstance(RESPONDD_TOPICS, list):
+                    print("ERROR: respondd_topics must be a list")
+                    exit(1)
+                REQUEST = f"GET {" ".join(RESPONDD_TOPICS)}".encode("ascii")
+
+            if "etcd" in config:
+                global ETCD_PREFIX
+                if not "prefix" in config["etcd"]:
+                    print("ERROR: etcd config must have a prefix")
+                    exit(1)
+                ETCD_PREFIX = config["etcd"]["prefix"]
+
+            if "influx" in config:
+                influx_config = config["influx"]
+                if not isinstance(influx_config, dict):
+                    print("ERROR: influx must be a mapping")
+                    exit(1)
+                if influx_config.get("enabled", False):
+                    connection_type = influx_config.get("connection_type", "socket")
+                    connection_string = influx_config.get(
+                        "endpoint", "/run/influxdb/influxdb.sock"
+                    )
+                    database = influx_config.get("database")
+                    if database is None:
+                        print("ERROR: influx config must have a database name")
+                        exit(1)
+
+                    global influx
+
+                    if connection_type == "socket":
+                        influx = InfluxDBClient(
+                            unix_socket=connection_string.netloc, db=database
+                        )
+                    elif connection_type == "http":
+                        connection_url = urlparse(connection_string)
+
+                        influx = InfluxDBClient(
+                            host=connection_url.hostname,
+                            port=connection_url.port,
+                            ssl=connection_url.scheme == "https",
+                            db=database,
+                            username=influx_config.get("username"),
+                            password=influx_config.get("password"),
+                        )
+                    else:
+                        print(
+                            f"ERROR: Unknown connection type {connection_type} for influx"
+                        )
+                        exit(1)
+
+
 def main():
+    load_config()
+
     loop = asyncio.get_event_loop()
     listen = loop.create_datagram_endpoint(ResponddProtocol, local_addr=("::", 0))
     transport, protocol = loop.run_until_complete(listen)
@@ -475,7 +560,8 @@ def main():
     loop.create_task(task_poll_http())
     loop.create_task(task_publish_nodes())
     loop.create_task(task_wd())
-    loop.create_task(task_influxdb_writer())
+    if influx is not None:
+        loop.create_task(task_influxdb_writer())
     try:
         loop.run_forever()
     except KeyboardInterrupt:
