@@ -11,17 +11,18 @@ from copy import deepcopy
 
 import aiohttp
 from aioetcd3.help import range_prefix
-#from influxdb import InfluxDBClient
+
+# from influxdb import InfluxDBClient
 from aioinflux import InfluxDBClient
 
 from ffbstools.etcd import etcd_client
 
 POLL_INTERVAL = 60
-PRUNE_INTERVAL = 5*POLL_INTERVAL
-CONFIG_PREFIX = '/config/'
-#YANIC_ADDR = ('::1', 11001)
-YANIC_ADDR = ('2001:bf7:381::3:1', 11001)
-REQUEST = 'GET nodeinfo statistics neighbours wireguard'.encode('ascii')
+PRUNE_INTERVAL = 5 * POLL_INTERVAL
+CONFIG_PREFIX = "/config/"
+# YANIC_ADDR = ('::1', 11001)
+YANIC_ADDR = ("2001:bf7:381::3:1", 11001)
+REQUEST = "GET nodeinfo statistics neighbours wireguard".encode("ascii")
 
 # dict of mesh mac addresses of indirect nodes, with {ip: insertion time} as value
 meshed_mac_ips = dict()
@@ -33,54 +34,61 @@ session = aiohttp.ClientSession(timeout=timeout)
 
 influxdb_queue = []
 
+
 def influxdb_wireguard(address, info):
     node_id = None
     for v in info.values():
-        if 'node_id' in v:
-            node_id = v['node_id']
+        if "node_id" in v:
+            node_id = v["node_id"]
     if node_id is None:
-        print('no node_id found in data from', address[0])
+        print("no node_id found in data from", address[0])
         return
-    if 'wireguard' not in info:
-        print('no wireguard report found in data from', address[0])
+    if "wireguard" not in info:
+        print("no wireguard report found in data from", address[0])
         return
     points = []
-    for if_name, if_info in info['wireguard']['interfaces'].items():
-        for peer_key, peer_info in if_info['peers'].items():
-            points.append({
-                "measurement": "wireguard",
-                "tags": {
-                    "nodeid": node_id,
-                    "interface": if_name,
-                    "peer": peer_key,
-                },
-                "fields": {
-                    "handshake": peer_info.get('handshake'),
-                    "rx": peer_info['transfer_rx'],
-                    "tx": peer_info['transfer_tx'],
-                },
-            })
+    for if_name, if_info in info["wireguard"]["interfaces"].items():
+        for peer_key, peer_info in if_info["peers"].items():
+            points.append(
+                {
+                    "measurement": "wireguard",
+                    "tags": {
+                        "nodeid": node_id,
+                        "interface": if_name,
+                        "peer": peer_key,
+                    },
+                    "fields": {
+                        "handshake": peer_info.get("handshake"),
+                        "rx": peer_info["transfer_rx"],
+                        "tx": peer_info["transfer_tx"],
+                    },
+                }
+            )
     influxdb_queue.extend(points)
+
 
 def influxdb_delay(address, info, delay):
     node_id = None
     for v in info.values():
-        if 'node_id' in v:
-            node_id = v['node_id']
+        if "node_id" in v:
+            node_id = v["node_id"]
     if node_id is None:
-        print('no node_id found in data from', address[0])
+        print("no node_id found in data from", address[0])
         return
     points = []
-    points.append({
-        "measurement": "respondd-delay",
-        "tags": {
-            "nodeid": node_id,
-        },
-        "fields": {
-            "rtt": delay,
-        },
-    })
+    points.append(
+        {
+            "measurement": "respondd-delay",
+            "tags": {
+                "nodeid": node_id,
+            },
+            "fields": {
+                "rtt": delay,
+            },
+        }
+    )
     influxdb_queue.extend(points)
+
 
 class Node:
     _nodes = {}
@@ -102,7 +110,9 @@ class Node:
             self._interfaces_ts = time.monotonic()
 
         try:
-            async with session.get('http://[{}]/cgi-bin/dyn/neighbours-batadv'.format(self.address)) as resp:
+            async with session.get(
+                "http://[{}]/cgi-bin/dyn/neighbours-batadv".format(self.address)
+            ) as resp:
                 line = await resp.content.readline()
                 resp.close()
         except asyncio.TimeoutError:
@@ -111,8 +121,8 @@ class Node:
         except aiohttp.client_exceptions.ClientConnectorError:
             return None
 
-        #print('neighbours-batadv: ', line.decode())
-        if not line.startswith(b'data: '):
+        # print('neighbours-batadv: ', line.decode())
+        if not line.startswith(b"data: "):
             self._neighbours = None
             return None
         data = json.loads(line[6:])
@@ -138,11 +148,15 @@ class Node:
 
         for interface in interfaces:
             try:
-                async with session.get('http://[{}]/cgi-bin/dyn/neighbours-nodeinfo?{}'.format(self.address, interface)) as resp:
+                async with session.get(
+                    "http://[{}]/cgi-bin/dyn/neighbours-nodeinfo?{}".format(
+                        self.address, interface
+                    )
+                ) as resp:
                     async for line in resp.content:
-                        if not line.startswith(b'data: '):
+                        if not line.startswith(b"data: "):
                             continue
-                        print('neighbours-nodeinfo', self.address, line.decode())
+                        print("neighbours-nodeinfo", self.address, line.decode())
                         data = json.loads(line[6:])
                         if data is None:
                             break
@@ -153,13 +167,15 @@ class Node:
                             neighbours[mac] = addresses[0]
                     resp.close()
             except asyncio.TimeoutError:
-                print(f"http read for neighbours on iface {interface} from {self.address} timed out")
+                print(
+                    f"http read for neighbours on iface {interface} from {self.address} timed out"
+                )
                 continue
             except aiohttp.client_exceptions.ClientConnectorError:
                 continue
 
         self._neighbours = neighbours
-        print('found neighbours', self.address, neighbours)
+        print("found neighbours", self.address, neighbours)
         return self._neighbours
 
     @classmethod
@@ -177,22 +193,22 @@ class ResponddProtocol:
 
     def datagram_received(self, data, address):
         delay = time.monotonic() - pings.get(address[0], 0.0)
-        if delay > POLL_INTERVAL/10:
+        if delay > POLL_INTERVAL / 10:
             delay = None
 
         self.transport.sendto(data, YANIC_ADDR)
 
         info = json.loads(inflate(data))
         if trace:
-            trace.write(json.dumps(info, indent=4)+'\n')
+            trace.write(json.dumps(info, indent=4) + "\n")
 
         influxdb_wireguard(address, info)
 
         if delay is not None:
             influxdb_delay(address, info, delay)
 
-        print('received', address[0])
-        #if address[0].endswith('::1'):
+        print("received", address[0])
+        # if address[0].endswith('::1'):
         #    if info['nodeinfo']:
         #        for mesh in info['nodeinfo']['network']['mesh'].values():
         #            for macs in mesh['interfaces'].values():
@@ -201,17 +217,18 @@ class ResponddProtocol:
         #        for neighs in info['neighbours']['batadv'].values():
         #            for node in neighs['neighbours'].keys():
         #                add_meshed_ip(node, mac_to_ipv6(node, address[0]), 'respondd')
-        #else:  # indirect response
-        if info['nodeinfo']:
-            for mesh in info['nodeinfo']['network']['mesh'].values():
-                for macs in mesh['interfaces'].values():
+        # else:  # indirect response
+        if info["nodeinfo"]:
+            for mesh in info["nodeinfo"]["network"]["mesh"].values():
+                for macs in mesh["interfaces"].values():
                     for mac in macs:
-                        add_meshed_ip(mac, address[0], 'respondd', acked=True)
+                        add_meshed_ip(mac, address[0], "respondd", acked=True)
 
-        etcd_nodes.queue(info['nodeinfo'])
+        etcd_nodes.queue(info["nodeinfo"])
 
     def error_received(self, exc):
-        print('error_received', exc)
+        print("error_received", exc)
+
 
 class EtcdNodes:
     def __init__(self):
@@ -223,7 +240,7 @@ class EtcdNodes:
         self._queue.append(deepcopy(nodeinfo))
 
     async def publish_one(self, nodeinfo):
-        nodeid = nodeinfo['node_id']
+        nodeid = nodeinfo["node_id"]
 
         now = time.time()
         age = now - self._timestamp.get(nodeid, 0)
@@ -237,7 +254,7 @@ class EtcdNodes:
         self._prev[nodeid] = nodeinfo
 
         data = nodeinfo.copy()
-        data['timestamp'] = time.time()
+        data["timestamp"] = time.time()
         key = "/node/{}".format(nodeid)
         await etcd_client.put(
             key,
@@ -248,20 +265,22 @@ class EtcdNodes:
         while self._queue:
             await self.publish_one(self._queue.pop(0))
 
+
 async def get_direct_ips():
     direct_ips = set()
     start = time.monotonic()
     raw = await etcd_client.range(key_range=range_prefix(CONFIG_PREFIX))
-    print('etcd_client.range took {}'.format(time.monotonic()-start))
-    for (k, v, meta) in raw:
-        if k.decode('ascii').endswith('/address6'):
-            direct_ips.add(v.decode('ascii'))
+    print("etcd_client.range took {}".format(time.monotonic() - start))
+    for k, v, meta in raw:
+        if k.decode("ascii").endswith("/address6"):
+            direct_ips.add(v.decode("ascii"))
     return direct_ips
+
 
 def get_meshed_ips(*, decrement=True, cutoff=0):
     meshed_ips = set()
     for ips in meshed_mac_ips.values():
-        print('ips', ips)
+        print("ips", ips)
         best = max(ips.values())
         if best < cutoff:
             continue
@@ -269,8 +288,13 @@ def get_meshed_ips(*, decrement=True, cutoff=0):
         if decrement:
             ips[selected] -= 1
         meshed_ips.add(selected)
-    print('get_meshed_ips(cutoff={}):\n from {}\n to {}'.format(cutoff, meshed_mac_ips, meshed_ips))
+    print(
+        "get_meshed_ips(cutoff={}):\n from {}\n to {}".format(
+            cutoff, meshed_mac_ips, meshed_ips
+        )
+    )
     return meshed_ips
+
 
 async def task_poll_step(transport):
     loop = asyncio.get_event_loop()
@@ -278,13 +302,14 @@ async def task_poll_step(transport):
     nodes = await get_direct_ips()
     nodes |= get_meshed_ips()
     nodes = sorted(nodes)
-    print('nodes:', nodes)
+    print("nodes:", nodes)
     offset = POLL_INTERVAL / len(nodes)
     for i, node in enumerate(nodes):
-        print('polling', node)
-        await asyncio.sleep(start + i*offset - loop.time())
+        print("polling", node)
+        await asyncio.sleep(start + i * offset - loop.time())
         pings[node] = time.monotonic()
         transport.sendto(REQUEST, (node, 1001))
+
 
 async def task_poll(transport):
     loop = asyncio.get_event_loop()
@@ -299,12 +324,13 @@ async def task_poll(transport):
         offset += POLL_INTERVAL
         await asyncio.sleep(offset - loop.time())
 
+
 async def task_prune():
     loop = asyncio.get_event_loop()
     while not loop.is_closed():
-        #await asyncio.sleep(PRUNE_INTERVAL)
+        # await asyncio.sleep(PRUNE_INTERVAL)
         await asyncio.sleep(30)
-        print('pruning')
+        print("pruning")
         old = time.monotonic() - PRUNE_INTERVAL
         for ips in meshed_mac_ips.values():
             for ip, tries in list(ips.items()):
@@ -317,16 +343,17 @@ async def task_prune():
         # remove macs without ips
         for mac in [mac for mac, ips in meshed_mac_ips.items() if not ips]:
             del meshed_mac_ips[mac]
-            print('pruned meshed mac {}'.format(mac))
-        with open('/tmp/polld-dump.tmp', 'w') as dump:
+            print("pruned meshed mac {}".format(mac))
+        with open("/tmp/polld-dump.tmp", "w") as dump:
             yaml.dump(meshed_mac_ips, dump)
-        os.rename('/tmp/polld-dump.tmp', '/tmp/polld-dump')
+        os.rename("/tmp/polld-dump.tmp", "/tmp/polld-dump")
+
 
 async def task_poll_http():
     loop = asyncio.get_event_loop()
     while not loop.is_closed():
         await asyncio.sleep(10)
-        print('poll_http: while')
+        print("poll_http: while")
         nodes = get_meshed_ips(decrement=False, cutoff=8)
         nodes = sorted(nodes)
         start = loop.time()
@@ -339,23 +366,29 @@ async def task_poll_http():
                 traceback.print_exc()
                 continue
             if not neighbours:
-                print(f'poll_http: no neighbours for {address} ({loop.time()-start:.2f} seconds)')
+                print(
+                    f"poll_http: no neighbours for {address} ({loop.time()-start:.2f} seconds)"
+                )
                 continue
             for mac, node_address in neighbours.items():
-                add_meshed_ip(mac, node_address, 'http')
-            print(f'poll_http: {len(neighbours)} neighbours for {address} ({loop.time()-start:.2f} seconds)')
+                add_meshed_ip(mac, node_address, "http")
+            print(
+                f"poll_http: {len(neighbours)} neighbours for {address} ({loop.time()-start:.2f} seconds)"
+            )
+
 
 async def task_publish_nodes():
     loop = asyncio.get_event_loop()
 
     while not loop.is_closed():
         await asyncio.sleep(15)
-        print('publish_nodes: while')
+        print("publish_nodes: while")
         try:
             await etcd_nodes.publish()
         except Exception:  # pylint: disable=broad-except
             traceback.print_exc()
             continue
+
 
 async def task_wd():
     loop = asyncio.get_event_loop()
@@ -370,6 +403,7 @@ async def task_wd():
         else:
             loops += 1
 
+
 async def task_influxdb_writer():
     loop = asyncio.get_event_loop()
     while not loop.is_closed():
@@ -381,7 +415,7 @@ async def task_influxdb_writer():
         start = time.monotonic()
         try:
             print("writing {} points to influxdb".format(len(pending)))
-            #await loop.run_in_executor(None, influx.write_points, pending)
+            # await loop.run_in_executor(None, influx.write_points, pending)
             await influx.write(pending)
         except Exception:  # pylint: disable=broad-except
             traceback.print_exc()
@@ -389,11 +423,13 @@ async def task_influxdb_writer():
         delay = time.monotonic() - start
         print("wrote {} points to influxdb in {} seconds".format(len(pending), delay))
 
+
 def add_meshed_ip(mac, ip, source, acked=False):
     ips = meshed_mac_ips.setdefault(mac, {})
     if ip not in ips:
         print("adding meshed ip {} for mac {} (using {})".format(ip, mac, source))
     ips[ip] = ips.get(ip, 5) + (2 if acked else 0)
+
 
 def inflate(data):
     decompress = zlib.decompressobj(-zlib.MAX_WBITS)
@@ -401,35 +437,38 @@ def inflate(data):
     inflated += decompress.flush()
     return inflated.decode()
 
+
 def mac_to_ipv6(mac, prefix):
-    parts = mac.split(':')
-    parts.insert(3, 'ff')
-    parts.insert(4, 'fe')
+    parts = mac.split(":")
+    parts.insert(3, "ff")
+    parts.insert(4, "fe")
     parts[0] = "%x" % (int(parts[0], 16) ^ 2)
-    ipv6 = [prefix.split('::', 1)[0]]
+    ipv6 = [prefix.split("::", 1)[0]]
     for i in range(0, len(parts), 2):
-        ipv6.append(''.join(parts[i:i+2]))
-    return ':'.join(ipv6)
+        ipv6.append("".join(parts[i : i + 2]))
+    return ":".join(ipv6)
+
 
 trace = None
-#trace = open('/tmp/polld-trace', 'w')
-#influx = InfluxDBClient(database='ffbs')
-influx = InfluxDBClient(unix_socket='/run/influxdb/influxdb.sock', db='ffbs')
+# trace = open('/tmp/polld-trace', 'w')
+# influx = InfluxDBClient(database='ffbs')
+influx = InfluxDBClient(unix_socket="/run/influxdb/influxdb.sock", db="ffbs")
 etcd_nodes = EtcdNodes()
 
 try:
-    with open('/tmp/polld-dump', 'r') as dump:
+    with open("/tmp/polld-dump", "r") as dump:
         meshed_mac_ips = yaml.load(dump, Loader=yaml.SafeLoader)
-    print(f'loaded /tmp/polld-dump with {len(meshed_mac_ips)} entries')
+    print(f"loaded /tmp/polld-dump with {len(meshed_mac_ips)} entries")
 except Exception as e:
-    print(f'could not load /tmp/polld-dump: {e}')
+    print(f"could not load /tmp/polld-dump: {e}")
 
 if not meshed_mac_ips:
     meshed_mac_ips = dict()
 
+
 def main():
     loop = asyncio.get_event_loop()
-    listen = loop.create_datagram_endpoint(ResponddProtocol, local_addr=('::', 0))
+    listen = loop.create_datagram_endpoint(ResponddProtocol, local_addr=("::", 0))
     transport, protocol = loop.run_until_complete(listen)
     loop.create_task(task_poll(transport))
     loop.create_task(task_prune())
@@ -445,5 +484,6 @@ def main():
     transport.close()
     loop.close()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
