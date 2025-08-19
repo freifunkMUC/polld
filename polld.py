@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
+from abc import ABC, abstractmethod
 import asyncio
 import json
 import os
 import random
+import sys
 import time
 import traceback
 import yaml
 import zlib
 from copy import deepcopy
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
 from aioetcd3.help import range_prefix
+import aioetcd3.client
 
 # from influxdb import InfluxDBClient
 from aioinflux import InfluxDBClient
 
-from ffbstools.etcd import etcd_client
-
-CONFIG_FILE = "/etc/polld.yaml"
+DEFAULT_CONFIG_PATH = "/etc/polld.yaml"
 
 POLL_INTERVAL = 60
 PRUNE_INTERVAL = 5 * POLL_INTERVAL
-ETCD_PREFIX: str
 YANIC_ADDR: Tuple[str, int]
 RESPONDD_TOPICS: List[str] = ["nodeinfo", "statistics", "neighbours", "wireguard"]
 REQUEST: bytes
@@ -34,10 +34,11 @@ meshed_mac_ips: Dict[str, Dict[str, int]] = dict()
 # map of last request timestamps
 pings = dict()
 
-timeout = aiohttp.ClientTimeout(total=30, connect=20)
-session = aiohttp.ClientSession(timeout=timeout)
+session: aiohttp.ClientSession
 
 influxdb_queue = []
+
+etcd_client: Optional[aioetcd3.client.Client] = None
 
 
 def influxdb_wireguard(address, info):
@@ -230,22 +231,39 @@ class ResponddProtocol:
                     for mac in macs:
                         add_meshed_ip(mac, address[0], "respondd", acked=True)
 
-        etcd_nodes.queue(info["nodeinfo"])
+        if node_storage is not None:
+            node_storage.queue(info["nodeinfo"])
 
     def error_received(self, exc):
         print("error_received", exc)
 
 
-class EtcdNodes:
-    def __init__(self):
-        self._prev = {}
-        self._timestamp = {}
-        self._queue = []
+NodeInfo = Dict[str, Any]
 
-    def queue(self, nodeinfo):
+
+class NodeStorage(ABC):
+    """Abstract base class for a nodeinfo storage interface."""
+
+    def __init__(self):
+        self._prev: Dict[str, NodeInfo] = {}
+        self._timestamp: Dict[str, float] = {}
+        self._queue: List[NodeInfo] = []
+
+    def queue(self, nodeinfo: NodeInfo):
         self._queue.append(deepcopy(nodeinfo))
 
-    async def publish_one(self, nodeinfo):
+    @abstractmethod
+    async def write(self, nodeid: str, data: NodeInfo):
+        """
+        Write a single nodeinfo to the storage backend.
+        """
+        pass
+
+    async def publish_one(self, nodeinfo: NodeInfo):
+        """
+        Process a single nodeinfo, calling into 'write()' to store it.
+        This method handles deduplication and rate limiting.
+        """
         nodeid = nodeinfo["node_id"]
 
         now = time.time()
@@ -261,27 +279,73 @@ class EtcdNodes:
 
         data = nodeinfo.copy()
         data["timestamp"] = time.time()
-        key = "/node/{}".format(nodeid)
-        await etcd_client.put(
-            key,
-            json.dumps(data, indent=2, sort_keys=True),
-        )
+
+        await self.write(nodeid, data)
 
     async def publish(self):
         while self._queue:
             await self.publish_one(self._queue.pop(0))
 
 
-async def get_direct_ips():
-    """Fetches IP addresses of ndoes with VPN uplink from etcd."""
-    direct_ips = set()
-    start = time.monotonic()
-    raw = await etcd_client.range(key_range=range_prefix(ETCD_PREFIX))
-    print("etcd_client.range took {}".format(time.monotonic() - start))
-    for k, v, meta in raw:
-        if k.decode("ascii").endswith("/address6"):
-            direct_ips.add(v.decode("ascii"))
-    return direct_ips
+class EtcdNodes(NodeStorage):
+
+    async def write(self, nodeid: str, data: NodeInfo):
+        key = "/node/{}".format(nodeid)
+        await etcd_client.put(
+            key,
+            json.dumps(data, indent=2, sort_keys=True),
+        )
+
+
+class NodeList(ABC):
+    """Abstract base class for a node list interface, i.e. a source to get the IP addresses for VPN-connected nodes from."""
+
+    @abstractmethod
+    async def get_direct_ips(self) -> set[str]:
+        """
+        Get the set of IP addresses of nodes with VPN uplink.
+        """
+        pass
+
+
+class EtcdNodeList(NodeList):
+    etcd_prefix: str
+
+    def __init__(self, prefix: str):
+        self.etcd_prefix = prefix
+
+    async def get_direct_ips(self) -> set[str]:
+        """Fetches IP addresses of nodes with VPN uplink from etcd."""
+        direct_ips = set()
+        start = time.monotonic()
+        raw = await etcd_client.range(key_range=range_prefix(self.etcd_prefix))
+        print("etcd_client.range took {}".format(time.monotonic() - start))
+        for k, v, meta in raw:
+            if k.decode("ascii").endswith("/address6"):
+                direct_ips.add(v.decode("ascii"))
+        return direct_ips
+
+
+class JsonNodeList(NodeList):
+    path: str
+
+    def __init__(self, path: str):
+        self.path = path
+
+    async def get_direct_ips(self) -> set[str]:
+        """Fetches IP addresses of nodes with VPN uplink from a JSON file."""
+        direct_ips = set()
+        try:
+            with open(self.path, "r") as f:
+                data = json.load(f)
+
+            for node in data.get("nodes", []):
+                address6 = node.get("address6")
+                if address6 is not None:
+                    direct_ips.add(address6)
+        except Exception as e:
+            print(f"Error reading {self.path}: {e}")
+        return direct_ips
 
 
 def get_meshed_ips(*, decrement=True, cutoff=0):
@@ -306,11 +370,11 @@ def get_meshed_ips(*, decrement=True, cutoff=0):
 async def task_poll_step(transport):
     loop = asyncio.get_event_loop()
     start = loop.time()
-    nodes = await get_direct_ips()
+    nodes = await direct_node_list.get_direct_ips()
     nodes |= get_meshed_ips()
     nodes = sorted(nodes)
     print("nodes:", nodes)
-    offset = POLL_INTERVAL / len(nodes)
+    offset = POLL_INTERVAL / max(len(nodes), 1)
     for i, node in enumerate(nodes):
         print("polling", node)
         await asyncio.sleep(start + i * offset - loop.time())
@@ -385,13 +449,16 @@ async def task_poll_http():
 
 
 async def task_publish_nodes():
+    assert (
+        node_storage is not None
+    ), "Node storage must be initialized for task_publish_nodes"
     loop = asyncio.get_event_loop()
 
     while not loop.is_closed():
         await asyncio.sleep(15)
         print("publish_nodes: while")
         try:
-            await etcd_nodes.publish()
+            await node_storage.publish()
         except Exception:  # pylint: disable=broad-except
             traceback.print_exc()
             continue
@@ -459,7 +526,9 @@ def mac_to_ipv6(mac, prefix):
 trace = None
 # trace = open('/tmp/polld-trace', 'w')
 influx: Optional[InfluxDBClient] = None
-etcd_nodes = EtcdNodes()
+
+node_storage: Optional[NodeStorage] = None
+direct_node_list: NodeList
 
 try:
     with open("/tmp/polld-dump", "r") as dump:
@@ -472,11 +541,11 @@ if not meshed_mac_ips:
     meshed_mac_ips = dict()
 
 
-def load_config():
+def load_config(config_path: str = DEFAULT_CONFIG_PATH):
     """Load configuration from /etc/polld.yaml and set global variables"""
 
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
             config = yaml.safe_load(f)
             if not config:
                 config = {}
@@ -503,12 +572,31 @@ def load_config():
                     exit(1)
                 REQUEST = f"GET {" ".join(RESPONDD_TOPICS)}".encode("ascii")
 
-            if "etcd" in config:
-                global ETCD_PREFIX
-                if not "prefix" in config["etcd"]:
-                    print("ERROR: etcd config must have a prefix")
-                    exit(1)
-                ETCD_PREFIX = config["etcd"]["prefix"]
+            if "node_list" in config:
+                global direct_node_list
+                node_list_config = config["node_list"]
+
+                if "etcd" in node_list_config:
+                    if not "prefix" in node_list_config["etcd"]:
+                        print("ERROR: etcd config must have a prefix")
+                        exit(1)
+                    etcd_prefix = node_list_config["etcd"]["prefix"]
+                    direct_node_list = EtcdNodeList(etcd_prefix)
+
+                    # TODO move into a separate config section with configurable etcd storage prefix
+                    global node_storage
+                    node_storage = EtcdNodes()
+
+                elif "jsonfile" in node_list_config:
+                    jsonfile_config = node_list_config["jsonfile"]
+                    if not isinstance(jsonfile_config, dict):
+                        print("ERROR: jsonfile must be a mapping")
+                        exit(1)
+                    path = jsonfile_config.get("path")
+                    if not path:
+                        print("ERROR: jsonfile config must have a path")
+                        exit(1)
+                    direct_node_list = JsonNodeList(path)
 
             if "influx" in config:
                 influx_config = config["influx"]
@@ -550,22 +638,37 @@ def load_config():
 
 
 def main():
-    load_config()
+    config_path = DEFAULT_CONFIG_PATH
+    if len(sys.argv) > 1:
+        config_path = sys.argv[1]
+    load_config(config_path)
+
+    if node_storage is not None:
+        global etcd_client
+        from ffbstools.etcd import etcd_client
 
     loop = asyncio.get_event_loop()
+
+    timeout = aiohttp.ClientTimeout(total=30, connect=20)
+    global session
+    session = aiohttp.ClientSession(timeout=timeout, loop=loop)
+
     listen = loop.create_datagram_endpoint(ResponddProtocol, local_addr=("::", 0))
     transport, protocol = loop.run_until_complete(listen)
     loop.create_task(task_poll(transport))
     loop.create_task(task_prune())
     loop.create_task(task_poll_http())
-    loop.create_task(task_publish_nodes())
     loop.create_task(task_wd())
     if influx is not None:
         loop.create_task(task_influxdb_writer())
+    if node_storage is not None:
+        loop.create_task(task_publish_nodes())
+
     try:
         loop.run_forever()
     except KeyboardInterrupt:
         pass
+
     loop.run_until_complete(session.close())
     transport.close()
     loop.close()

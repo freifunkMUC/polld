@@ -13,10 +13,19 @@ respondd_topics:
   - neighbours
   - wireguard
 
-# Prefix for etcd configuration entries
-etcd:
+# The node info source to use (to load list of IP addresses of VPN-connected nodes).
+# Must contain the configuration for one (and only one) of etcd, netbox or jsonfile.
+node_list:
   # Connection config for the etcd client is done in /etc/etcd-client.json, see etcd.py
-  prefix: '/config/'
+  etcd:
+    # Prefix for node configuration entries in etcd, as implemented by etcdconfigweb.
+    # Each node should have one associated key that ends on '/address6', whose value is the IPv6 address of the node, under which it can be reached.
+    # Discovered nodeinfo will be stored in currently hardcoded '/node/' prefix.
+    prefix: '/config/'
+
+  jsonfile:
+    # Expects a JSON file with a 'nodes' key that is a list of objects, where each object has an 'address6' string item.
+    path: '/var/run/polld.json'
 
 # InfluxDB configuration
 influx:
