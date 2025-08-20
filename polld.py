@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-from abc import ABC, abstractmethod
+# SPDX-FileCopyrightText: 2019 Jan Lübbe
+# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-FileContributor: 2025 Kilian Schauer
 import asyncio
 import json
 import os
@@ -9,6 +11,7 @@ import time
 import traceback
 import yaml
 import zlib
+from abc import ABC, abstractmethod
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
