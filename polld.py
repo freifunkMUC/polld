@@ -733,7 +733,7 @@ def main():
         global etcd_client
         from ffbstools.etcd import etcd_client
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
 
     timeout = aiohttp.ClientTimeout(total=30, connect=20)
     global session
