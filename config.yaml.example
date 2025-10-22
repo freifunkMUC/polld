@@ -23,6 +23,20 @@ node_list:
     # Discovered nodeinfo will be stored in currently hardcoded '/node/' prefix.
     prefix: '/config/'
 
+  netbox:
+    # A mapping of filters for Netbox to find the allocated node prefixes.
+    # If you're using wgkex, should match the "netbox_additional_data" configuration setting.
+    # E.g. {role: NodePrefixes} or {cf_my_custom_field: 'Some Value', tag: [ node-prefix, another-tag ]}
+    # See https://demo.netbox.dev/api/schema/swagger-ui/#/ipam/ipam_prefixes_list and https://netboxlabs.com/docs/netbox/reference/filtering/ for filtering syntax
+    filter:
+      tag: # AND combined
+        - 123 # ID of a tag
+        - node-prefix # another tag uniquely identified through its slug
+
+    # URL for your NetBox instance, without the "/api" path
+    url: http://localhost:8000
+    api_key: SECRET
+
   jsonfile:
     # Expects a JSON file with a 'nodes' key that is a list of objects, where each object has an 'address6' string item.
     path: '/var/run/polld.json'

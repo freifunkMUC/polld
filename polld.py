@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # SPDX-FileContributor: 2025 Kilian Schauer
 import asyncio
+import ipaddress
 import json
 import os
 import random
@@ -329,6 +330,67 @@ class EtcdNodeList(NodeList):
         return direct_ips
 
 
+class NetboxNodeList(NodeList):
+    api_url: str
+    api_key: str
+    filter_params: Dict[str, Any]
+
+    def __init__(self, api_url: str, api_key: str, filter_params: Dict[str, Any]):
+        self.api_url = api_url
+        self.api_key = api_key
+        self.filter_params = filter_params
+
+    async def get_direct_ips(self) -> set[str]:
+        """Fetches IP addresses of nodes with VPN uplink from a JSON file."""
+        direct_ips = set()
+        params = self.filter_params.copy()
+        params["limit"] = 200
+
+        url = f"{self.api_url}/api/ipam/prefixes/"
+
+        retry = 0
+        loop = asyncio.get_event_loop()
+        while not loop.is_closed() and url is not None:
+            if retry > 3:
+                print(f"Giving up on NetBox request after {retry} retries: {url}")
+                return direct_ips
+            if retry > 0:
+                # exponential backoff, but don't wait longer than half the poll interval
+                await asyncio.sleep(min(2**retry, POLL_INTERVAL / 2))
+            retry += 1
+
+            try:
+                async with session.get(
+                    url,
+                    params=params,
+                    headers={"Authorization": f"Token {self.api_key}"},
+                    raise_for_status=True,
+                ) as resp:
+                    data = await resp.json()
+
+                    for node in data.get("results", []):
+                        prefix = ipaddress.ip_network(node.get("prefix"))
+                        address6 = prefix.network_address + 1
+                        direct_ips.add(str(address6))
+
+                    url = data.get("next")
+                    params = None  # are embedded in the "next" url
+                    retry = 0  # reset retry counter on success for next page
+
+            except asyncio.TimeoutError:
+                print(f"HTTP request timed out to NetBox (retry {retry}): {url}")
+                continue  # retry
+            except aiohttp.ClientConnectionError as e:
+                print(f"HTTP connection error to NetBox (retry {retry}): {e}")
+                continue  # retry
+            except aiohttp.ClientResponseError as e:
+                print(f"HTTP response error from NetBox (retry {retry}): {e}")
+                if e.status >= 500:
+                    continue  # retry
+                return direct_ips  # give up on client errors (4xx etc.)
+        return direct_ips
+
+
 class JsonNodeList(NodeList):
     path: str
 
@@ -589,6 +651,27 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH):
                     # TODO move into a separate config section with configurable etcd storage prefix
                     global node_storage
                     node_storage = EtcdNodes()
+
+                elif "netbox" in node_list_config:
+                    netbox_config = node_list_config["netbox"]
+                    if not isinstance(netbox_config, dict):
+                        print("ERROR: netbox must be a mapping")
+                        exit(1)
+                    if (
+                        not "url" in netbox_config
+                        or not "api_key" in netbox_config
+                        or not "filter" in netbox_config
+                    ):
+                        print(
+                            "ERROR: netbox config must have a url, api_key and filter"
+                        )
+                        exit(1)
+
+                    direct_node_list = NetboxNodeList(
+                        api_url=netbox_config["url"],
+                        api_key=netbox_config["api_key"],
+                        filter_params=netbox_config["filter"],
+                    )
 
                 elif "jsonfile" in node_list_config:
                     jsonfile_config = node_list_config["jsonfile"]
