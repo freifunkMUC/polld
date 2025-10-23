@@ -197,12 +197,12 @@ class Node:
         return node
 
 
-class ResponddProtocol:
+class ResponddProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport):
         self.transport = transport
 
-    def datagram_received(self, data, address):
-        delay = time.monotonic() - pings.get(address[0], 0.0)
+    def datagram_received(self, data, addr):
+        delay = time.monotonic() - pings.get(addr[0], 0.0)
         if delay > POLL_INTERVAL / 10:
             delay = None
 
@@ -213,12 +213,12 @@ class ResponddProtocol:
             trace.write(json.dumps(info, indent=4) + "\n")
 
         if influx is not None:
-            influxdb_wireguard(address, info)
+            influxdb_wireguard(addr, info)
 
             if delay is not None:
-                influxdb_delay(address, info, delay)
+                influxdb_delay(addr, info, delay)
 
-        print("received", address[0])
+        print("received", addr[0])
         # if address[0].endswith('::1'):
         #    if info['nodeinfo']:
         #        for mesh in info['nodeinfo']['network']['mesh'].values():
@@ -233,7 +233,7 @@ class ResponddProtocol:
             for mesh in info["nodeinfo"]["network"]["mesh"].values():
                 for macs in mesh["interfaces"].values():
                     for mac in macs:
-                        add_meshed_ip(mac, address[0], "respondd", acked=True)
+                        add_meshed_ip(mac, addr[0], "respondd", acked=True)
 
         if node_storage is not None:
             node_storage.queue(info["nodeinfo"])
@@ -432,7 +432,7 @@ def get_meshed_ips(*, decrement=True, cutoff=0):
     return meshed_ips
 
 
-async def task_poll_step(transport):
+async def task_poll_step(transport: asyncio.DatagramTransport):
     loop = asyncio.get_event_loop()
     start = loop.time()
     nodes = await direct_node_list.get_direct_ips()
@@ -444,10 +444,10 @@ async def task_poll_step(transport):
         print("polling", node)
         await asyncio.sleep(start + i * offset - loop.time())
         pings[node] = time.monotonic()
-        transport.sendto(REQUEST, (node, 1001))
+        transport.sendto(REQUEST, (node, 1001))  # non-blocking
 
 
-async def task_poll(transport):
+async def task_poll(transport: asyncio.DatagramTransport):
     loop = asyncio.get_event_loop()
     offset = loop.time()
     while not loop.is_closed():
