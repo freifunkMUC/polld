@@ -345,6 +345,7 @@ class NetboxNodeList(NodeList):
         direct_ips = set()
         params = self.filter_params.copy()
         params["limit"] = 200
+        params["brief"] = 1  # we don't need the full output, just the prefix field
 
         url = f"{self.api_url}/api/ipam/prefixes/"
 
@@ -596,7 +597,7 @@ node_storage: Optional[NodeStorage] = None
 direct_node_list: NodeList
 
 try:
-    with open("/tmp/polld-dump", "r") as dump:
+    with open("/tmp/polld-dump", "r+") as dump:
         meshed_mac_ips = yaml.load(dump, Loader=yaml.SafeLoader)
     print(f"loaded /tmp/polld-dump with {len(meshed_mac_ips)} entries")
 except Exception as e:
