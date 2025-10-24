@@ -5,6 +5,8 @@
 import asyncio
 import ipaddress
 import json
+import logging
+import logging.config
 import os
 import random
 import sys
@@ -33,7 +35,9 @@ RESPONDD_TOPICS: List[str] = ["nodeinfo", "statistics", "neighbours", "wireguard
 REQUEST: bytes
 
 
-# dict of mesh mac addresses of indirect nodes, with {ip: insertion time} as value
+logger = logging.getLogger("polld")
+
+# dict of mesh mac addresses of indirect nodes, with {ip1: remaining_tries, ip2: remaining_tries, ...} as value
 meshed_mac_ips: Dict[str, Dict[str, int]] = dict()
 # map of last request timestamps
 pings = dict()
@@ -51,10 +55,10 @@ def influxdb_wireguard(address, info):
         if "node_id" in v:
             node_id = v["node_id"]
     if node_id is None:
-        print("no node_id found in data from", address[0])
+        logger.info("no node_id found in data from %s", address[0])
         return
     if "wireguard" not in info:
-        print("no wireguard report found in data from", address[0])
+        logger.info("no wireguard report found in data from %s", address[0])
         return
     points = []
     for if_name, if_info in info["wireguard"]["interfaces"].items():
@@ -83,7 +87,7 @@ def influxdb_delay(address, info, delay):
         if "node_id" in v:
             node_id = v["node_id"]
     if node_id is None:
-        print("no node_id found in data from", address[0])
+        logger.info("no node_id found in data from %s", address[0])
         return
     points = []
     points.append(
@@ -126,12 +130,12 @@ class Node:
                 line = await resp.content.readline()
                 resp.close()
         except asyncio.TimeoutError:
-            print(f"http read for interfaces from {self.address} timed out")
+            logger.info("http read for interfaces from %s timed out", self.address)
             return None
-        except aiohttp.client_exceptions.ClientConnectorError:
+        except aiohttp.ClientConnectorError:
             return None
 
-        # print('neighbours-batadv: ', line.decode())
+        logger.debug("neighbours-batadv: %s", line.decode())
         if not line.startswith(b"data: "):
             self._neighbours = None
             return None
@@ -166,7 +170,9 @@ class Node:
                     async for line in resp.content:
                         if not line.startswith(b"data: "):
                             continue
-                        print("neighbours-nodeinfo", self.address, line.decode())
+                        logger.debug(
+                            "neighbours-nodeinfo: %s: %s", self.address, line.decode()
+                        )
                         data = json.loads(line[6:])
                         if data is None:
                             break
@@ -177,15 +183,17 @@ class Node:
                             neighbours[mac] = addresses[0]
                     resp.close()
             except asyncio.TimeoutError:
-                print(
-                    f"http read for neighbours on iface {interface} from {self.address} timed out"
+                logger.debug(
+                    "http: read for neighbours on iface %s from %s timed out",
+                    interface,
+                    self.address,
                 )
                 continue
-            except aiohttp.client_exceptions.ClientConnectorError:
+            except aiohttp.ClientConnectorError:
                 continue
 
         self._neighbours = neighbours
-        print("found neighbours", self.address, neighbours)
+        logger.debug("http: found neighbours: %s: %s", self.address, neighbours)
         return self._neighbours
 
     @classmethod
@@ -218,7 +226,7 @@ class ResponddProtocol(asyncio.DatagramProtocol):
             if delay is not None:
                 influxdb_delay(addr, info, delay)
 
-        print("received", addr[0])
+        logger.debug("datagram received: %s", addr[0])
         # if address[0].endswith('::1'):
         #    if info['nodeinfo']:
         #        for mesh in info['nodeinfo']['network']['mesh'].values():
@@ -239,7 +247,7 @@ class ResponddProtocol(asyncio.DatagramProtocol):
             node_storage.queue(info["nodeinfo"])
 
     def error_received(self, exc):
-        print("error_received", exc)
+        logger.info("datagram error received:", exc_info=exc)
 
 
 NodeInfo = Dict[str, Any]
@@ -323,7 +331,7 @@ class EtcdNodeList(NodeList):
         direct_ips = set()
         start = time.monotonic()
         raw = await etcd_client.range(key_range=range_prefix(self.etcd_prefix))
-        print("etcd_client.range took {}".format(time.monotonic() - start))
+        logger.info("etcd_client.range took %.2f", time.monotonic() - start)
         for k, v, meta in raw:
             if k.decode("ascii").endswith("/address6"):
                 direct_ips.add(v.decode("ascii"))
@@ -353,7 +361,9 @@ class NetboxNodeList(NodeList):
         loop = asyncio.get_event_loop()
         while not loop.is_closed() and url is not None:
             if retry > 3:
-                print(f"Giving up on NetBox request after {retry} retries: {url}")
+                logger.error(
+                    "Giving up on NetBox request after %d retries: %s", retry, url
+                )
                 return direct_ips
             if retry > 0:
                 # exponential backoff, but don't wait longer than half the poll interval
@@ -378,14 +388,23 @@ class NetboxNodeList(NodeList):
                     params = None  # are embedded in the "next" url
                     retry = 0  # reset retry counter on success for next page
 
-            except asyncio.TimeoutError:
-                print(f"HTTP request timed out to NetBox (retry {retry}): {url}")
+            except asyncio.TimeoutError as e:
+                logger.error(
+                    "HTTP request timed out to NetBox (retry %d): %s",
+                    retry,
+                    url,
+                    exc_info=e,
+                )
                 continue  # retry
             except aiohttp.ClientConnectionError as e:
-                print(f"HTTP connection error to NetBox (retry {retry}): {e}")
+                logger.error(
+                    "HTTP connection error to NetBox (retry %d)", retry, exc_info=e
+                )
                 continue  # retry
             except aiohttp.ClientResponseError as e:
-                print(f"HTTP response error from NetBox (retry {retry}): {e}")
+                logger.error(
+                    "HTTP response error from NetBox (retry %d)", retry, exc_info=e
+                )
                 if e.status >= 500:
                     continue  # retry
                 return direct_ips  # give up on client errors (4xx etc.)
@@ -410,45 +429,52 @@ class JsonNodeList(NodeList):
                 if address6 is not None:
                     direct_ips.add(address6)
         except Exception as e:
-            print(f"Error reading {self.path}: {e}")
+            logger.error("Error reading %s", self.path, exc_info=e)
         return direct_ips
 
 
 def get_meshed_ips(*, decrement=True, cutoff=0):
+    """Return a set of IP addresses of meshed nodes, choosing the most responsive IP address per MAC address.
+    Decrement the try counter for selected IPs if 'decrement' is True."""
+
     meshed_ips = set()
-    for ips in meshed_mac_ips.values():
-        print("ips", ips)
+    for mac, ips in meshed_mac_ips.items():
+        logger.debug(
+            "get_meshed_ips: available IP addresses + tries for MAC %s: %s",
+            mac,
+            str(ips),
+        )
         best = max(ips.values())
         if best < cutoff:
             continue
         selected = random.choice([ip for ip, tries in ips.items() if tries == best])
         if decrement:
             ips[selected] -= 1
+        logger.debug("get_meshed_ips: selected %s", selected)
         meshed_ips.add(selected)
-    print(
-        "get_meshed_ips(cutoff={}):\n from {}\n to {}".format(
-            cutoff, meshed_mac_ips, meshed_ips
-        )
-    )
     return meshed_ips
 
 
 async def task_poll_step(transport: asyncio.DatagramTransport):
+    """Perform a single poll step, sending Yanic requests to all known direct-connected and meshed nodes."""
+
     loop = asyncio.get_event_loop()
     start = loop.time()
     nodes = await direct_node_list.get_direct_ips()
     nodes |= get_meshed_ips()
     nodes = sorted(nodes)
-    print("nodes:", nodes)
+    logger.debug("poll: all nodes: %s", str(nodes))
     offset = POLL_INTERVAL / max(len(nodes), 1)
     for i, node in enumerate(nodes):
-        print("polling", node)
+        logger.debug("poll: node: %s", node)
         await asyncio.sleep(start + i * offset - loop.time())
         pings[node] = time.monotonic()
         transport.sendto(REQUEST, (node, 1001))  # non-blocking
 
 
 async def task_poll(transport: asyncio.DatagramTransport):
+    """Periodically poll all known nodes via Yanic."""
+
     loop = asyncio.get_event_loop()
     offset = loop.time()
     while not loop.is_closed():
@@ -467,7 +493,7 @@ async def task_prune():
     while not loop.is_closed():
         # await asyncio.sleep(PRUNE_INTERVAL)
         await asyncio.sleep(30)
-        print("pruning")
+        logger.debug("Pruning unresponsive mesh nodes")
         old = time.monotonic() - PRUNE_INTERVAL
         for ips in meshed_mac_ips.values():
             for ip, tries in list(ips.items()):
@@ -480,17 +506,18 @@ async def task_prune():
         # remove macs without ips
         for mac in [mac for mac, ips in meshed_mac_ips.items() if not ips]:
             del meshed_mac_ips[mac]
-            print("pruned meshed mac {}".format(mac))
+            logger.info("Pruned meshed mac with no known IP address %s", mac)
         with open("/tmp/polld-dump.tmp", "w") as dump:
             yaml.dump(meshed_mac_ips, dump)
         os.rename("/tmp/polld-dump.tmp", "/tmp/polld-dump")
 
 
 async def task_poll_http():
+    """Periodically poll all known meshed nodes via their HTTP interface to get their mesh neighbours."""
     loop = asyncio.get_event_loop()
     while not loop.is_closed():
         await asyncio.sleep(10)
-        print("poll_http: while")
+        logger.debug("poll_http: start new run")
         nodes = get_meshed_ips(decrement=False, cutoff=8)
         nodes = sorted(nodes)
         start = loop.time()
@@ -503,14 +530,19 @@ async def task_poll_http():
                 traceback.print_exc()
                 continue
             if not neighbours:
-                print(
-                    f"poll_http: no neighbours for {address} ({loop.time()-start:.2f} seconds)"
+                logger.debug(
+                    "poll_http: found no neighbours for %s (%.2f seconds)",
+                    address,
+                    loop.time() - start,
                 )
                 continue
             for mac, node_address in neighbours.items():
                 add_meshed_ip(mac, node_address, "http")
-            print(
-                f"poll_http: {len(neighbours)} neighbours for {address} ({loop.time()-start:.2f} seconds)"
+            logger.debug(
+                "poll_http: found %d neighbours for %s (%.2f seconds)",
+                len(neighbours),
+                address,
+                loop.time() - start,
             )
 
 
@@ -522,7 +554,7 @@ async def task_publish_nodes():
 
     while not loop.is_closed():
         await asyncio.sleep(15)
-        print("publish_nodes: while")
+        logger.debug("publish_nodes: start new run")
         try:
             await node_storage.publish()
         except Exception:  # pylint: disable=broad-except
@@ -531,6 +563,8 @@ async def task_publish_nodes():
 
 
 async def task_wd():
+    """Watchdog task to detect event loop stalls/overload."""
+
     loop = asyncio.get_event_loop()
     loops = 0
     while not loop.is_closed():
@@ -538,7 +572,7 @@ async def task_wd():
         await asyncio.sleep(0.1)
         delay = time.monotonic() - start
         if delay > 0.2:
-            print("unexpected delay of {} after {} good loops".format(delay, loops))
+            logger.debug("unexpected delay of %.2f after %d good loops", delay, loops)
             loops = 0
         else:
             loops += 1
@@ -554,20 +588,22 @@ async def task_influxdb_writer():
             continue
         start = time.monotonic()
         try:
-            print("writing {} points to influxdb".format(len(pending)))
+            logger.debug("writing %d points to influxdb", len(pending))
             # await loop.run_in_executor(None, influx.write_points, pending)
             await influx.write(pending)
         except Exception:  # pylint: disable=broad-except
             traceback.print_exc()
             continue
         delay = time.monotonic() - start
-        print("wrote {} points to influxdb in {} seconds".format(len(pending), delay))
+        logger.debug("wrote %d points to influxdb in %.2f seconds", len(pending), delay)
 
 
 def add_meshed_ip(mac, ip, source, acked=False):
     ips = meshed_mac_ips.setdefault(mac, {})
     if ip not in ips:
-        print("adding meshed ip {} for mac {} (using {})".format(ip, mac, source))
+        logger.debug(
+            "adding meshed ip %s for mac %s (discovered via %s)", ip, mac, source
+        )
     ips[ip] = ips.get(ip, 5) + (2 if acked else 0)
 
 
@@ -596,16 +632,6 @@ influx: Optional[InfluxDBClient] = None
 node_storage: Optional[NodeStorage] = None
 direct_node_list: NodeList
 
-try:
-    with open("/tmp/polld-dump", "r+") as dump:
-        meshed_mac_ips = yaml.load(dump, Loader=yaml.SafeLoader)
-    print(f"loaded /tmp/polld-dump with {len(meshed_mac_ips)} entries")
-except Exception as e:
-    print(f"could not load /tmp/polld-dump: {e}")
-
-if not meshed_mac_ips:
-    meshed_mac_ips = dict()
-
 
 def load_config(config_path: str = DEFAULT_CONFIG_PATH):
     """Load configuration from /etc/polld.yaml and set global variables"""
@@ -616,25 +642,39 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH):
             if not config:
                 config = {}
 
+            logging.basicConfig(level=logging.INFO)
+            if "logging" in config:
+                logging_config = config["logging"]
+                if isinstance(logging_config, dict):
+                    logging.config.dictConfig(logging_config)
+                    logger.disabled = False  # loading a config for the root logger disables all already existing loggers, including ours
+                    logger.info("Logging configured from config file")
+                else:
+                    print(
+                        "ERROR: logging config must be a mapping, following the schema: https://docs.python.org/3/library/logging.config.html#logging-config-dictschema"
+                    )
+                    exit(1)
+
             if "yanic" in config:
                 yanic_config = config["yanic"]
                 yanic_host = yanic_config.get("host")
                 yanic_port = yanic_config.get("port")
                 if yanic_host is None or yanic_port is None:
-                    print("ERROR: yanic_addr must have host and port")
+                    logger.error("yanic_addr must have host and port")
                     exit(1)
 
                 global YANIC_ADDR
                 YANIC_ADDR = (yanic_host, yanic_port)
+                logger.info("Writing to Yanic at %s", str(YANIC_ADDR))
             else:
-                print("ERROR: Missing yanic in config")
+                logger.error("Missing yanic in config")
                 exit(1)
 
             if "respondd_topics" in config:
                 global RESPONDD_TOPICS, REQUEST
                 RESPONDD_TOPICS = config["respondd_topics"]
                 if not isinstance(RESPONDD_TOPICS, list):
-                    print("ERROR: respondd_topics must be a list")
+                    logger.error("respondd_topics must be a list")
                     exit(1)
                 REQUEST = f"GET {" ".join(RESPONDD_TOPICS)}".encode("ascii")
 
@@ -644,10 +684,14 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH):
 
                 if "etcd" in node_list_config:
                     if not "prefix" in node_list_config["etcd"]:
-                        print("ERROR: etcd config must have a prefix")
+                        logger.error("etcd config must have a prefix")
                         exit(1)
                     etcd_prefix = node_list_config["etcd"]["prefix"]
                     direct_node_list = EtcdNodeList(etcd_prefix)
+
+                    logger.info(
+                        "Using etcd as node list source with prefix %s", etcd_prefix
+                    )
 
                     # TODO move into a separate config section with configurable etcd storage prefix
                     global node_storage
@@ -656,15 +700,15 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH):
                 elif "netbox" in node_list_config:
                     netbox_config = node_list_config["netbox"]
                     if not isinstance(netbox_config, dict):
-                        print("ERROR: netbox must be a mapping")
+                        logger.error("netbox must be a mapping")
                         exit(1)
                     if (
                         not "url" in netbox_config
                         or not "api_key" in netbox_config
                         or not "filter" in netbox_config
                     ):
-                        print(
-                            "ERROR: netbox config must have a url, api_key and filter"
+                        logger.error(
+                            "netbox config must have a url, api_key and filter"
                         )
                         exit(1)
 
@@ -674,21 +718,31 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH):
                         filter_params=netbox_config["filter"],
                     )
 
+                    logger.info(
+                        "Using NetBox as node list source with URL '%s' and filter '%s'",
+                        str(netbox_config["url"]),
+                        str(
+                            netbox_config["filter"],
+                        ),
+                    )
+
                 elif "jsonfile" in node_list_config:
                     jsonfile_config = node_list_config["jsonfile"]
                     if not isinstance(jsonfile_config, dict):
-                        print("ERROR: jsonfile must be a mapping")
+                        logger.error("jsonfile must be a mapping")
                         exit(1)
                     path = jsonfile_config.get("path")
                     if not path:
-                        print("ERROR: jsonfile config must have a path")
+                        logger.error("jsonfile config must have a path")
                         exit(1)
                     direct_node_list = JsonNodeList(path)
+
+                    logger.info("Using JSON-file as node list source at '%s'", path)
 
             if "influx" in config:
                 influx_config = config["influx"]
                 if not isinstance(influx_config, dict):
-                    print("ERROR: influx must be a mapping")
+                    logger.error("influx must be a mapping")
                     exit(1)
                 if influx_config.get("enabled", False):
                     connection_type = influx_config.get("connection_type", "socket")
@@ -697,7 +751,7 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH):
                     )
                     database = influx_config.get("database")
                     if database is None:
-                        print("ERROR: influx config must have a database name")
+                        logger.error("influx config must have a database name")
                         exit(1)
 
                     global influx
@@ -718,8 +772,8 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH):
                             password=influx_config.get("password"),
                         )
                     else:
-                        print(
-                            f"ERROR: Unknown connection type {connection_type} for influx"
+                        logger.error(
+                            "Unknown connection type %s for influx", connection_type
                         )
                         exit(1)
 
@@ -729,6 +783,17 @@ def main():
     if len(sys.argv) > 1:
         config_path = sys.argv[1]
     load_config(config_path)
+
+    global meshed_mac_ips
+    try:
+        with open("/tmp/polld-dump", "r+") as dump:
+            meshed_mac_ips = yaml.load(dump, Loader=yaml.SafeLoader)
+        logger.info("loaded /tmp/polld-dump with %d entries", len(meshed_mac_ips))
+    except Exception as e:
+        logger.error("could not load /tmp/polld-dump", exc_info=e)
+
+    if not meshed_mac_ips:
+        meshed_mac_ips = dict()
 
     if node_storage is not None:
         global etcd_client
