@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # SPDX-FileContributor: 2025 Kilian Schauer
 import asyncio
+import errno
 import ipaddress
 import json
 import logging
@@ -247,6 +248,13 @@ class ResponddProtocol(asyncio.DatagramProtocol):
             node_storage.queue(info["nodeinfo"])
 
     def error_received(self, exc):
+        # Nodes that are offline have no route to their prefix: expected, no traceback
+        if isinstance(exc, OSError) and exc.errno in (
+            errno.ENETUNREACH,
+            errno.EHOSTUNREACH,
+        ):
+            logger.debug("datagram error received: %s", exc)
+            return
         logger.info("datagram error received:", exc_info=exc)
 
 
