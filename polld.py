@@ -31,6 +31,11 @@ DEFAULT_CONFIG_PATH = "/etc/polld.yaml"
 
 POLL_INTERVAL = 60
 PRUNE_INTERVAL = 5 * POLL_INTERVAL
+# Cache times for the HTTP mesh neighbour discovery of a node.
+# neighbours-batadv only lists interfaces that have a neighbour now, so refresh
+# it often: a new Wi-Fi mesh link must not stay hidden for a long time.
+INTERFACES_MAX_AGE = 120
+NEIGHBOURS_MAX_AGE = 600
 YANIC_ADDR: Tuple[str, int]
 RESPONDD_TOPICS: List[str] = ["nodeinfo", "statistics", "neighbours", "wireguard"]
 REQUEST: bytes
@@ -111,18 +116,17 @@ class Node:
     def __init__(self, address):
         self.address = address
         self._interfaces = None
-        self._interfaces_ts = -3600
+        self._interfaces_ts = -INTERFACES_MAX_AGE
         self._neighbours = None
-        self._neighbours_ts = -3600
+        self._neighbours_ts = -NEIGHBOURS_MAX_AGE
 
     async def get_interfaces(self):
         age = time.monotonic() - self._interfaces_ts
-        if age < 3600:
+        if age < INTERFACES_MAX_AGE:
             return self._interfaces
-        else:
-            interfaces = self._interfaces or set()
-            self._interfaces = None
-            self._interfaces_ts = time.monotonic()
+        self._interfaces_ts = time.monotonic()
+        # Keep the known interfaces if the refresh fails.
+        interfaces = set(self._interfaces or ())
 
         try:
             async with session.get(
@@ -132,27 +136,31 @@ class Node:
                 resp.close()
         except asyncio.TimeoutError:
             logger.info("http read for interfaces from %s timed out", self.address)
-            return None
+            return self._interfaces
         except aiohttp.ClientConnectorError:
-            return None
+            return self._interfaces
 
         logger.debug("neighbours-batadv: %s", line.decode())
         if not line.startswith(b"data: "):
-            self._neighbours = None
-            return None
+            return self._interfaces
         data = json.loads(line[6:])
         for neighbour in data.values():
             ifname = neighbour.get("ifname")
             if ifname:
                 interfaces.add(ifname)
 
-        self._interfaces = interfaces
+        new = interfaces - (self._interfaces or set())
+        if new and self._interfaces:
+            # A new mesh link: query its neighbours now, not at the next refresh.
+            logger.info("new mesh interfaces on %s: %s", self.address, sorted(new))
+            self._neighbours_ts = -NEIGHBOURS_MAX_AGE
+        self._interfaces = interfaces or None
         return self._interfaces
 
     async def get_neighbours(self):
         interfaces = await self.get_interfaces()
         age = time.monotonic() - self._neighbours_ts
-        if age < 600:
+        if age < NEIGHBOURS_MAX_AGE:
             return self._neighbours
         elif not interfaces:
             return None
