@@ -140,10 +140,10 @@ class Node:
         except aiohttp.ClientConnectorError:
             return self._interfaces
 
-        logger.debug("neighbours-batadv: %s", line.decode())
+        logger.debug("neighbours-batadv: %s", line.decode(errors="replace"))
         if not line.startswith(b"data: "):
             return self._interfaces
-        data = json.loads(line[6:])
+        data = json.loads(line[6:].decode("utf-8", errors="replace"))
         for neighbour in data.values():
             ifname = neighbour.get("ifname")
             if ifname:
@@ -180,9 +180,11 @@ class Node:
                         if not line.startswith(b"data: "):
                             continue
                         logger.debug(
-                            "neighbours-nodeinfo: %s: %s", self.address, line.decode()
+                            "neighbours-nodeinfo: %s: %s",
+                            self.address,
+                            line.decode(errors="replace"),
                         )
-                        data = json.loads(line[6:])
+                        data = json.loads(line[6:].decode("utf-8", errors="replace"))
                         if data is None:
                             break
                         # is this the correct MAC?
