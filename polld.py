@@ -225,7 +225,11 @@ class ResponddProtocol(asyncio.DatagramProtocol):
 
         self.transport.sendto(data, YANIC_ADDR)
 
-        info = json.loads(inflate(data))
+        try:
+            info = json.loads(inflate(data))
+        except (zlib.error, ValueError) as exc:
+            logger.warning("invalid respondd reply from %s: %s", addr[0], exc)
+            return
         if trace:
             trace.write(json.dumps(info, indent=4) + "\n")
 
@@ -627,7 +631,8 @@ def inflate(data):
     decompress = zlib.decompressobj(-zlib.MAX_WBITS)
     inflated = decompress.decompress(data)
     inflated += decompress.flush()
-    return inflated.decode()
+    # Node strings (e.g. hostname) can contain cut multi-byte characters
+    return inflated.decode(errors="replace")
 
 
 def mac_to_ipv6(mac, prefix):
