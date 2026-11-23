@@ -36,6 +36,13 @@ PRUNE_INTERVAL = 5 * POLL_INTERVAL
 # it often: a new Wi-Fi mesh link must not stay hidden for a long time.
 INTERFACES_MAX_AGE = 120
 NEIGHBOURS_MAX_AGE = 600
+# HTTP mesh neighbour discovery: a new run starts every HTTP_POLL_INTERVAL
+# seconds (or when the previous run ends, if it takes longer).
+HTTP_POLL_INTERVAL = 10
+HTTP_POLL_CONCURRENCY = 64
+# A new MAC starts with 5 tries (7 if it answers respondd), and each answered
+# respondd poll adds 1 net. Thus 6 means "answered at least once".
+HTTP_POLL_CUTOFF = 6
 YANIC_ADDR: Tuple[str, int]
 RESPONDD_TOPICS: List[str] = ["nodeinfo", "statistics", "neighbours", "wireguard"]
 REQUEST: bytes
@@ -534,38 +541,47 @@ async def task_prune():
         os.rename("/tmp/polld-dump.tmp", "/tmp/polld-dump")
 
 
+async def poll_http_node(address: str, limit: asyncio.Semaphore):
+    """Poll one meshed node via HTTP and add its mesh neighbours."""
+    loop = asyncio.get_event_loop()
+    async with limit:
+        start = loop.time()
+        try:
+            neighbours = await Node.get(address).get_neighbours()
+        except Exception:  # pylint: disable=broad-except
+            traceback.print_exc()
+            return
+    if not neighbours:
+        logger.debug(
+            "poll_http: found no neighbours for %s (%.2f seconds)",
+            address,
+            loop.time() - start,
+        )
+        return
+    for mac, node_address in neighbours.items():
+        add_meshed_ip(mac, node_address, "http")
+    logger.debug(
+        "poll_http: found %d neighbours for %s (%.2f seconds)",
+        len(neighbours),
+        address,
+        loop.time() - start,
+    )
+
+
 async def task_poll_http():
     """Periodically poll all known meshed nodes via their HTTP interface to get their mesh neighbours."""
     loop = asyncio.get_event_loop()
+    limit = asyncio.Semaphore(HTTP_POLL_CONCURRENCY)
     while not loop.is_closed():
-        await asyncio.sleep(10)
-        logger.debug("poll_http: start new run")
-        nodes = get_meshed_ips(decrement=False, cutoff=8)
-        nodes = sorted(nodes)
         start = loop.time()
-        for address in nodes:
-            start = loop.time()
-            node = Node.get(address)
-            try:
-                neighbours = await node.get_neighbours()
-            except Exception:  # pylint: disable=broad-except
-                traceback.print_exc()
-                continue
-            if not neighbours:
-                logger.debug(
-                    "poll_http: found no neighbours for %s (%.2f seconds)",
-                    address,
-                    loop.time() - start,
-                )
-                continue
-            for mac, node_address in neighbours.items():
-                add_meshed_ip(mac, node_address, "http")
-            logger.debug(
-                "poll_http: found %d neighbours for %s (%.2f seconds)",
-                len(neighbours),
-                address,
-                loop.time() - start,
-            )
+        nodes = sorted(get_meshed_ips(decrement=False, cutoff=HTTP_POLL_CUTOFF))
+        await asyncio.gather(*(poll_http_node(address, limit) for address in nodes))
+        logger.debug(
+            "poll_http: polled %d nodes in %.2f seconds",
+            len(nodes),
+            loop.time() - start,
+        )
+        await asyncio.sleep(max(0, start + HTTP_POLL_INTERVAL - loop.time()))
 
 
 async def task_publish_nodes():
